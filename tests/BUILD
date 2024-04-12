@@ -84,6 +84,14 @@ jax_test(
 )
 
 jax_test(
+    name = "cudnn_fusion_test",
+    srcs = ["cudnn_fusion_test.py"],
+    deps = [
+        "//jax:cudnn",
+    ],
+)
+
+jax_test(
     name = "custom_object_test",
     srcs = ["custom_object_test.py"],
 )

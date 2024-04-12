@@ -1114,13 +1114,25 @@ pytype_library(
 )
 
 pytype_library(
-    name = "fused_attention_stablehlo",
+    name = "cudnn",
     srcs = [
         "_src/cudnn/__init__.py",
+    ],
+    visibility = [":internal"],
+    deps = [
+        ":experimental",
+        ":jax",
+    ],
+)
+
+pytype_library(
+    name = "fused_attention_stablehlo",
+    srcs = [
         "_src/cudnn/fused_attention_stablehlo.py",
     ],
     visibility = [":internal"],
     deps = [
+        ":cudnn",
         ":experimental",
         ":jax",
     ],

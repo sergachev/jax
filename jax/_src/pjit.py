@@ -60,6 +60,7 @@ from jax._src.interpreters import mlir
 from jax._src.interpreters import pxla
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import func as func_dialect
+from jax._src.lib.mlir.dialects import hlo
 from jax._src.lib import xla_client as xc
 from jax._src.lib import xla_extension_version
 from jax._src.sharding_impls import (
@@ -162,6 +163,7 @@ class PjitInfo(NamedTuple):
   backend: str | None
   keep_unused: bool
   inline: bool
+  custom_call_target: str | None
   abstracted_axes: Any | None
   has_explicit_sharding: bool
   use_resource_env: bool  # False for jit, True for pjit
@@ -372,7 +374,8 @@ def _parse_jit_arguments(fun: Callable, in_shardings: Any, out_shardings: Any,
                          static_argnames: str | Iterable[str] | None,
                          device: xc.Device | None, backend: str | None,
                          abstracted_axes: Any | None, keep_unused: bool,
-                         inline: bool, use_resource_env: bool) -> PjitInfo:
+                         inline: bool, custom_call_target: str | None,
+                         use_resource_env: bool) -> PjitInfo:
   """Parses the arguments to jit/pjit.
 
   Performs any preprocessing and validation of the arguments that we can do
@@ -449,6 +452,7 @@ def _parse_jit_arguments(fun: Callable, in_shardings: Any, out_shardings: Any,
         static_argnames=static_argnames, donate_argnums=donate_argnums,
         donate_argnames=donate_argnames, device=device, backend=backend,
         keep_unused=keep_unused, inline=inline,
+        custom_call_target=custom_call_target,
         abstracted_axes=abstracted_axes,
         has_explicit_sharding=has_explicit_sharding,
         use_resource_env=use_resource_env)
@@ -503,12 +507,13 @@ def make_jit(fun: Callable, in_shardings: Any, out_shardings: Any,
              static_argnames: str | Iterable[str] | None,
              device: xc.Device | None, backend: str | None,
              abstracted_axes: Any | None, keep_unused: bool,
-             inline: bool, use_resource_env: bool) -> Any:
+             inline: bool, custom_call_target: str | None,
+             use_resource_env: bool) -> Any:
   """jit() and pjit() are thin wrappers around this function."""
   jit_info = _parse_jit_arguments(
         fun, in_shardings, out_shardings, donate_argnums, donate_argnames,
         static_argnums, static_argnames, device, backend, abstracted_axes,
-        keep_unused, inline, use_resource_env)
+        keep_unused, inline, custom_call_target, use_resource_env)
   return _make_jit_wrapper(jit_info)
 
 
@@ -518,7 +523,7 @@ def _infer_params(jit_info, args, kwargs):
    out_shardings_leaves, in_layouts_treedef, in_layouts_leaves,
    out_layouts_treedef, out_layouts_leaves, static_argnums, static_argnames,
    donate_argnums, donate_argnames, device, backend, keep_unused, inline,
-   abstracted_axes, _, use_resource_env) = jit_info
+   custom_call_target, abstracted_axes, _, use_resource_env) = jit_info
 
   have_kwargs = bool(kwargs)
   if have_kwargs and user_specified_in_shardings:
@@ -608,7 +613,7 @@ def _infer_params(jit_info, args, kwargs):
       flat_fun, out_shardings_treedef, out_shardings_leaves,
       out_layouts_treedef, out_layouts_leaves, in_type, dbg,
       device_or_backend_set, HashableFunction(out_tree, closure=()),
-      HashableFunction(res_paths, closure=()), inline)
+      HashableFunction(res_paths, closure=()), inline, custom_call_target)
 
   assert len(explicit_args) == len(in_shardings_flat) == len(in_layouts_flat)
 
@@ -637,6 +642,7 @@ def _infer_params(jit_info, args, kwargs):
       name=getattr(flat_fun, '__name__', '<unknown>'),
       keep_unused=keep_unused,
       inline=inline,
+      custom_call_target=custom_call_target,
   )
   return (consts + args_flat, in_type, params, in_tree, out_tree(),
           donated_invars, dbg.arg_names if dbg else None, attrs_tracked)
@@ -702,6 +708,7 @@ def pjit(
     device: xc.Device | None = None,
     backend: str | None = None,
     inline: bool = False,
+    custom_call_target: str | None = None,
     abstracted_axes: Any | None = None,
 ) -> JitWrapped:
   """Makes ``fun`` compiled and automatically partitioned across multiple devices.
@@ -884,7 +891,7 @@ def pjit(
   return make_jit(
        fun, in_shardings, out_shardings, donate_argnums, donate_argnames,
        static_argnums, static_argnames, device, backend, abstracted_axes,
-       keep_unused, inline, use_resource_env=True)
+       keep_unused, inline, custom_call_target, use_resource_env=True)
 
 
 def hashable_pytree(pytree):
@@ -1034,7 +1041,7 @@ def explain_tracing_cache_miss(
   if config.check_tracer_leaks.value: return
 
   def unpack(key):
-    transforms, (), _, (in_type, debug_info, _, inline), *_, ctx = key
+    transforms, (), _, (in_type, debug_info, _, inline, _), *_, ctx = key
     # TODO(dougalm,mattjj): enable cache miss explanation with attrs
     _, (_, (in_tree,)), *_ = transforms
     return in_tree, in_type, debug_info, inline.val, ctx
@@ -1158,8 +1165,9 @@ def explain_tracing_cache_miss(
   return done()
 
 @partial(lu.cache, explain=explain_tracing_cache_miss)
-def _create_pjit_jaxpr(fun, in_type, debug_info, out_paths, ignored_inline):
+def _create_pjit_jaxpr(fun, in_type, debug_info, out_paths, ignored_inline, ignored_custom_call_target):
   del ignored_inline  # just for explain_cache_miss
+  del ignored_custom_call_target
   with dispatch.log_elapsed_time(
       "Finished tracing + transforming {fun_name} for pjit in {elapsed_time} sec",
       fun_name=fun.__name__, event=dispatch.JAXPR_TRACE_EVENT):
@@ -1220,9 +1228,9 @@ def _check_and_canonicalize_out_shardings(
 
 def _pjit_jaxpr(fun, out_shardings_treedef, out_shardings_leaves,
                 out_layouts_treedef, out_layouts_leaves, in_type, debug_info,
-                device_or_backend_set, out_tree, result_paths, inline):
+                device_or_backend_set, out_tree, result_paths, inline, custom_call_target):
   jaxpr, final_consts, out_type, attrs_tracked = _create_pjit_jaxpr(
-      fun, in_type, debug_info, result_paths, IgnoreKey(inline))
+      fun, in_type, debug_info, result_paths, IgnoreKey(inline), IgnoreKey(custom_call_target))
   canonicalized_out_shardings_flat, out_layouts_flat = _check_and_canonicalize_out_shardings(
       out_shardings_treedef, out_shardings_leaves, out_layouts_treedef,
       out_layouts_leaves, out_tree, tuple(out_type),
@@ -1430,7 +1438,7 @@ def _resolve_in_shardings(
 
 def _resolve_and_lower(
     args, jaxpr, in_shardings, out_shardings, in_layouts,
-    out_layouts, resource_env, donated_invars, name, keep_unused, inline,
+    out_layouts, resource_env, donated_invars, name, keep_unused, inline, custom_call_target,
     lowering_parameters):
   in_shardings = _resolve_in_shardings(
       args, in_shardings, out_shardings,
@@ -1439,21 +1447,22 @@ def _resolve_and_lower(
                                    jaxpr.in_avals)
   lowered = _pjit_lower(
       jaxpr, in_shardings, out_shardings, in_layouts, out_layouts, resource_env,
-      donated_invars, name, keep_unused, inline,
+      donated_invars, name, keep_unused, inline, custom_call_target,
       lowering_parameters=lowering_parameters)
   return lowered
 
 
 def _pjit_call_impl_python(
     *args, jaxpr, in_shardings, out_shardings, in_layouts, out_layouts,
-    resource_env, donated_invars, name, keep_unused, inline):
+    resource_env, donated_invars, name, keep_unused, inline, custom_call_target):
   global _most_recent_pjit_call_executable
 
   compiled = _resolve_and_lower(
       args, jaxpr=jaxpr, in_shardings=in_shardings, out_shardings=out_shardings,
       in_layouts=in_layouts, out_layouts=out_layouts, resource_env=resource_env,
       donated_invars=donated_invars, name=name, keep_unused=keep_unused,
-      inline=inline, lowering_parameters=mlir.LoweringParameters()).compile()
+      inline=inline, custom_call_target=custom_call_target,
+      lowering_parameters=mlir.LoweringParameters()).compile()
 
   _most_recent_pjit_call_executable.weak_key_dict[jaxpr] = compiled
   # This check is expensive so only do it if enable_checks is on.
@@ -1507,7 +1516,7 @@ def _pjit_call_impl_python(
 @weakref_lru_cache
 def _get_jaxpr_as_fun(jaxpr, in_shardings, out_shardings, in_layouts,
                       out_layouts, resource_env, donated_invars, name,
-                      keep_unused, inline):
+                      keep_unused, inline, custom_call_target):
   # The input jaxpr to `_get_jaxpr_as_fun` is under a weakref_lru_cache so
   # returning `core.jaxpr_as_fun(jaxpr)` directly creates a strong reference to
   # the jaxpr defeating the purpose of weakref_lru_cache. So return a function
@@ -1521,14 +1530,14 @@ def _get_jaxpr_as_fun(jaxpr, in_shardings, out_shardings, in_layouts,
 def _pjit_call_impl(*args, jaxpr,
                     in_shardings, out_shardings, in_layouts, out_layouts,
                     resource_env,
-                    donated_invars, name, keep_unused, inline):
+                    donated_invars, name, keep_unused, inline, custom_call_target):
   def call_impl_cache_miss(*args_, **kwargs_):
     out_flat, compiled = _pjit_call_impl_python(
         *args, jaxpr=jaxpr, in_shardings=in_shardings,
         out_shardings=out_shardings, in_layouts=in_layouts,
         out_layouts=out_layouts, resource_env=resource_env,
         donated_invars=donated_invars, name=name, keep_unused=keep_unused,
-        inline=inline)
+        inline=inline, custom_call_target=custom_call_target)
     fastpath_data = _get_fastpath_data(
         compiled, tree_structure(out_flat), args, out_flat, [], jaxpr.effects,
         jaxpr.consts, None)
@@ -1536,7 +1545,7 @@ def _pjit_call_impl(*args, jaxpr,
 
   f = _get_jaxpr_as_fun(
       jaxpr, in_shardings, out_shardings, in_layouts, out_layouts,
-      resource_env, donated_invars, name, keep_unused, inline)
+      resource_env, donated_invars, name, keep_unused, inline, custom_call_target)
   donated_argnums = [i for i, d in enumerate(donated_invars) if d]
   has_explicit_sharding = _pjit_explicit_sharding(
       in_shardings, out_shardings, None, None)
@@ -1570,6 +1579,7 @@ def _pjit_lower_cached(
     name: str,
     keep_unused: bool,
     inline: bool,
+    custom_call_target,
     *,
     lowering_parameters: mlir.LoweringParameters):
   if resource_env is not None:
@@ -1707,7 +1717,7 @@ def _pjit_cached_lower_jaxpr_to_fun(ctx, name, jaxpr, effects, in_shardings,
 
 def _pjit_lowering(ctx, *args, name, jaxpr, in_shardings,
                    out_shardings, in_layouts, out_layouts, resource_env,
-                   donated_invars, keep_unused, inline):
+                   donated_invars, keep_unused, inline, custom_call_target):
   effects = list(ctx.tokens_in.effects())
   output_types = map(mlir.aval_to_ir_types, ctx.avals_out)
   output_types = [mlir.token_type()] * len(effects) + output_types
@@ -1720,9 +1730,17 @@ def _pjit_lowering(ctx, *args, name, jaxpr, in_shardings,
 
   tokens_in = [ctx.tokens_in.get(eff) for eff in effects]
   args = (*ctx.dim_var_values, *tokens_in, *args)
-  call = func_dialect.CallOp(flat_output_types,
-                             ir.FlatSymbolRefAttr.get(func.name.value),
-                             mlir.flatten_lowering_ir_args(args))
+  if custom_call_target is None:
+    call = func_dialect.CallOp(flat_output_types,
+                              ir.FlatSymbolRefAttr.get(func.name.value),
+                              mlir.flatten_lowering_ir_args(args))
+  else:
+    call = hlo.CustomCallOp(flat_output_types, mlir.flatten_lowering_ir_args(args),
+                            call_target_name=custom_call_target,
+                            called_computations=ir.ArrayAttr.get(
+                              [ir.FlatSymbolRefAttr.get(func.name.value)]
+                            ),
+                          )
   out_nodes = unflatten(call.results, map(len, output_types))
   tokens, out_nodes = split_list(out_nodes, [len(effects)])
   tokens_out = ctx.tokens_in.update_tokens(mlir.TokenSet(zip(effects, tokens)))
@@ -1736,7 +1754,7 @@ def _pjit_batcher(insert_axis, spmd_axis_name,
                   axis_size, axis_name, main_type,
                   vals_in, dims_in,
                   jaxpr, in_shardings, out_shardings, in_layouts, out_layouts,
-                  resource_env, donated_invars, name, keep_unused, inline):
+                  resource_env, donated_invars, name, keep_unused, inline, custom_call_target):
   segment_lens, dims_in = batching.indirectify_ragged_axes(dims_in)
   new_jaxpr, axes_out = batching.batch_jaxpr2(
       jaxpr, axis_size, dims_in, axis_name=axis_name,
@@ -1776,7 +1794,9 @@ def _pjit_batcher(insert_axis, spmd_axis_name,
     donated_invars=donated_invars,
     name=name,
     keep_unused=keep_unused,
-    inline=inline)
+    inline=inline,
+    custom_call_target=custom_call_target,
+    )
 
   resolved_axes_out = batching.resolve_ragged_axes_against_inputs_outputs(
       vals_in, vals_out, axes_out)
@@ -1824,7 +1844,7 @@ def _pjit_batcher_for_sharding(
 
 def _pjit_jvp(primals_in, tangents_in,
               jaxpr, in_shardings, out_shardings, in_layouts, out_layouts,
-              resource_env, donated_invars, name, keep_unused, inline):
+              resource_env, donated_invars, name, keep_unused, inline, custom_call_target):
   if any(isinstance(c, core.MutableArray) for c in jaxpr.consts):
     jaxpr, mut_primals = pxla._move_mutable_consts(jaxpr)
     mut_tangents = map(ad_util.zeros_like_jaxval, mut_primals)
@@ -1856,7 +1876,8 @@ def _pjit_jvp(primals_in, tangents_in,
       donated_invars=(*donated_invars, *_filter_zeros_in(donated_invars)),
       name=name,
       keep_unused=keep_unused,
-      inline=inline)
+      inline=inline,
+      custom_call_target=custom_call_target)
 
   primals_out, tangents_out = split_list(outputs, [len(jaxpr.jaxpr.outvars)])
   assert len(primals_out) == len(jaxpr.jaxpr.outvars)
@@ -1878,7 +1899,7 @@ def _known_jaxpr_fwd(known_jaxpr: core.ClosedJaxpr,
 def _pjit_partial_eval(trace, *in_tracers,
                        jaxpr, in_shardings, out_shardings,
                        in_layouts, out_layouts, resource_env, donated_invars,
-                       name, keep_unused, inline):
+                       name, keep_unused, inline, custom_call_target):
   in_pvals = [t.pval for t in in_tracers]
 
   known_ins = tuple(pv.is_known() for pv in in_pvals)
@@ -1936,7 +1957,8 @@ def _pjit_partial_eval(trace, *in_tracers,
       in_layouts=keep_where(in_layouts, known_ins),
       out_layouts=known_out_layouts, resource_env=resource_env,
       donated_invars=keep_where(donated_invars, known_ins),
-      name=name, keep_unused=keep_unused, inline=inline)
+      name=name, keep_unused=keep_unused, inline=inline,
+      custom_call_target=custom_call_target)
   assert len(known_params['out_shardings']) == len(known_params['jaxpr'].out_avals)
   assert len(known_params['out_layouts']) == len(known_params['jaxpr'].out_avals)
 
@@ -1970,7 +1992,8 @@ def _pjit_partial_eval(trace, *in_tracers,
                       (False,) * num_residuals),
       name=name,
       keep_unused=keep_unused,
-      inline=inline)
+      inline=inline,
+      custom_call_target=custom_call_target)
   unknown_tracers_in = [t for t in in_tracers if not t.pval.is_known()]
   unknown_out_avals = unknown_jaxpr.out_avals
   unknown_tracers_out = [
@@ -2050,7 +2073,7 @@ def _pjit_transpose_trace(fun, in_avals):
 
 def _pjit_transpose(cts_in, *primals_in,
                     jaxpr, in_shardings, out_shardings, in_layouts, out_layouts,
-                    resource_env, donated_invars, name, keep_unused, inline):
+                    resource_env, donated_invars, name, keep_unused, inline, custom_call_target):
   def prune_type(ty, xs, maybe_zeros):
     return tuple(x for x, mz in zip(xs, maybe_zeros) if type(mz) is not ty)
 
@@ -2101,7 +2124,8 @@ def _pjit_transpose(cts_in, *primals_in,
       donated_invars=(False,) * len(primals_and_nz_cts_in),
       name=name,
       keep_unused=keep_unused,
-      inline=inline)
+      inline=inline,
+      custom_call_target=custom_call_target)
 
   if attrs_tracked:
     final_states, nz_cts_out = split_list(nz_cts_out, [len(init_states)])
